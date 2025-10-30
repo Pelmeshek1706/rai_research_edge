@@ -2,13 +2,6 @@
 
 import torch.nn as nn
 import brevitas.nn as qnn
-import brevitas.quant as quant
-
-from brevitas.nn import QuantConv2d
-from brevitas.nn import QuantLinear
-from brevitas.nn import QuantReLU
-from brevitas.nn import TruncAvgPool2d
-
 
 from brevitas.quant import Int32Bias
 from brevitas.quant import Int8Bias
@@ -59,6 +52,45 @@ class h_swish(nn.Module):
 
     def forward(self, x):
         return x * self.sigmoid(x)
+    
+class QuantHsigmoid(nn.Module):
+    def __init__(self, bit_width=8):
+        super().__init__()
+        # Quantize input and output
+        self.quant_in = qnn.QuantIdentity(bit_width=bit_width, 
+                                          act_quant=CommonUintActQuant, 
+                                          return_quant_tensor=True,
+                                          requires_input_scale=False)
+        self.quant_out = qnn.QuantIdentity(bit_width=bit_width, 
+                                           act_quant=CommonUintActQuant, 
+                                           return_quant_tensor=True,
+                                           requires_input_scale=False)
+        # Quantized ReLU6 equivalent
+        self.relu6 = qnn.QuantReLU(bit_width=bit_width, 
+                                   max_val=6.0, 
+                                   return_quant_tensor=True,
+                                   requires_input_scale=False)
+
+    def forward(self, x):
+        x = self.quant_in(x)
+        x = self.relu6(x + 3.0) / 6.0
+        x = self.quant_out(x)
+        return x
+
+class QuantHswish(nn.Module):
+    def __init__(self, bit_width=8):
+        super().__init__()
+        self.hsigmoid = QuantHsigmoid(bit_width)
+        self.quant_out = qnn.QuantIdentity(bit_width=bit_width, 
+                                           act_quant=CommonUintActQuant, 
+                                           return_quant_tensor=True,
+                                           requires_input_scale=False)
+
+    def forward(self, x):
+        x_sig = self.hsigmoid(x)
+        x = x * x_sig
+        x = self.quant_out(x)
+        return x
 
 
 class SELayer(nn.Module):
@@ -80,7 +112,7 @@ class SELayer(nn.Module):
                             bias_quant=Int8Bias,
                             weight_quant=weight_quant,
                             weight_bit_width=weight_bit_width),
-                h_sigmoid()
+                QuantHswish(bit_width=act_bit_width)
         )
 
     def forward(self, x):
@@ -90,23 +122,23 @@ class SELayer(nn.Module):
         return x * y
 
 
-def conv_3x3_bn(inp, oup, stride, weight_quant, weight_bit_width):
+def conv_3x3_bn(inp, oup, stride, weight_quant, weight_bit_width, act_bit_width):
     return nn.Sequential(
         qnn.QuantConv2d(inp, oup, 3, stride, 1, bias=False,
                         weight_quant=weight_quant,
                         weight_bit_width=weight_bit_width),
         nn.BatchNorm2d(oup),
-        h_swish()
+        QuantHswish(bit_width=act_bit_width)
     )
 
 
-def conv_1x1_bn(inp, oup, weight_quant, weight_bit_width):
+def conv_1x1_bn(inp, oup, weight_quant, weight_bit_width, act_bit_width):
     return nn.Sequential(
         qnn.QuantConv2d(inp, oup, 1, 1, 0, bias=False, 
                         weight_quant=weight_quant,
                         weight_bit_width=weight_bit_width),
         nn.BatchNorm2d(oup),
-        h_swish()
+       QuantHswish(bit_width=act_bit_width)
     )
 
 
@@ -124,7 +156,7 @@ class InvertedResidual(nn.Module):
                                 weight_quant=weight_quant,
                                 weight_bit_width=weight_bit_width),
                 nn.BatchNorm2d(hidden_dim),
-                h_swish() if use_hs else qnn.QuantReLU(inplace=True,
+                QuantHswish(bit_width=act_bit_width) if use_hs else qnn.QuantReLU(inplace=True,
                                                        bit_width=act_bit_width,
                                                        act_quant=CommonUintActQuant,
                                                        return_quant_tensor=True),
@@ -143,21 +175,23 @@ class InvertedResidual(nn.Module):
                                 weight_quant=weight_quant,
                                 weight_bit_width=weight_bit_width),
                 nn.BatchNorm2d(hidden_dim),
-                h_swish() if use_hs else qnn.QuantReLU(inplace=True,
+                QuantHswish(bit_width=act_bit_width) if use_hs else qnn.QuantReLU(inplace=True,
                                                        bit_width=act_bit_width,
                                                        act_quant=CommonUintActQuant,
-                                                       return_quant_tensor=True),
+                                                       return_quant_tensor=True,
+                                                       requires_input_scale=False),
                 # dw
                 qnn.QuantConv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim, bias=False,
                                weight_quant=weight_quant,
                                weight_bit_width=weight_bit_width),
                 nn.BatchNorm2d(hidden_dim),
                 # Squeeze-and-Excite
-                SELayer(hidden_dim, weight_bit_width=weight_bit_width) if use_se else nn.Identity(),
-                h_swish() if use_hs else qnn.QuantReLU(inplace=True,
+                SELayer(hidden_dim, weight_bit_width=weight_bit_width) if use_se else qnn.QuantIdentity(),
+                QuantHswish(bit_width=act_bit_width) if use_hs else qnn.QuantReLU(inplace=True,
                                                        bit_width=act_bit_width,
                                                        act_quant=CommonUintActQuant,
-                                                       return_quant_tensor=True),
+                                                       return_quant_tensor=True,
+                                                       requires_input_scale=False),
                 # pw-linear
                 qnn.QuantConv2d(hidden_dim, oup, 1, 1, 0, bias=False,
                           weight_quant=weight_quant,
@@ -185,7 +219,13 @@ class MobileNetV3(nn.Module):
 
         # building first layer
         input_channel = _make_divisible(16 * width_mult, 8)
-        layers = [conv_3x3_bn(3, input_channel, 2, weight_quant, weight_bit_width)]
+        layers = [
+            qnn.QuantIdentity(
+                act_quant=CommonUintActQuant,
+                bit_width=act_bit_width, 
+                return_quant_tensor=True,
+                requires_input_scale=False),
+            conv_3x3_bn(3, input_channel, 2, weight_quant, weight_bit_width, act_bit_width)]
         # building inverted residual blocks
         block = InvertedResidual
         for k, t, c, use_se, use_hs, s in self.cfgs:
@@ -195,7 +235,7 @@ class MobileNetV3(nn.Module):
             input_channel = output_channel
         self.features = nn.Sequential(*layers)
         # building last several layers
-        self.conv = conv_1x1_bn(input_channel, exp_size, weight_quant, weight_bit_width)
+        self.conv = conv_1x1_bn(input_channel, exp_size, weight_quant, weight_bit_width, act_bit_width)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         output_channel = {'large': 1280, 'small': 1024}
         output_channel = _make_divisible(output_channel[mode] * width_mult, 8) if width_mult > 1.0 else output_channel[mode]
