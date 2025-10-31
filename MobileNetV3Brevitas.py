@@ -115,7 +115,7 @@ class SELayer(nn.Module):
                             weight_quant=weight_quant,
                             weight_bit_width=weight_bit_width,
                             return_quant_tensor=True),
-                QuantHswish(bit_width=act_bit_width)
+                QuantHsigmoid(bit_width=act_bit_width)
         )
 
     def forward(self, x):
@@ -164,7 +164,7 @@ class InvertedResidual(nn.Module):
                                                        act_quant=CommonUintActQuant,
                                                        return_quant_tensor=True),
                 # Squeeze-and-Excite
-                SELayer(hidden_dim, weight_bit_width=weight_bit_width) if use_se else qnn.QuantIdentity(return_quant_tensor=True),
+                SELayer(hidden_dim, weight_bit_width=weight_bit_width, act_bit_width=act_bit_width) if use_se else qnn.QuantIdentity(return_quant_tensor=True),
                 # pw-linear
                 qnn.QuantConv2d(hidden_dim, oup, 1, 1, 0, bias=False,
                                 weight_quant=weight_quant,
