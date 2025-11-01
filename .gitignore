@@ -1,8 +1,2 @@
 /data/*
 !/data/.gitkeep
-
-/trained_models/*
-!/trained_models/.gitkeep
-
-/logs/*
-!/logs/.gitkeep

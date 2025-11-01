@@ -89,9 +89,6 @@ class QuantHswish(nn.Module):
         x = self.quant_out(x)
         return x
 
-class Int4Bias(IntBias):
-    bit_width = 4
-
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=4, weight_quant=CommonIntWeightPerTensorQuant, weight_bit_width=8, act_bit_width=8):
         super(SELayer, self).__init__()
@@ -104,7 +101,7 @@ class SELayer(nn.Module):
                 ),
                 qnn.QuantLinear(channel, _make_divisible(channel // reduction, 8),
                                 bias=True,
-                                bias_quant=Int4Bias if weight_bit_width == 4 else Int8Bias,
+                                bias_quant=Int32Bias,
                                 weight_quant=weight_quant,
                                 weight_bit_width=weight_bit_width,
                                 return_quant_tensor=True),
@@ -114,7 +111,7 @@ class SELayer(nn.Module):
                               return_quant_tensor=True),
                 qnn.QuantLinear(_make_divisible(channel // reduction, 8), channel,
                             bias=True,
-                            bias_quant=Int4Bias if weight_bit_width == 4 else Int8Bias,
+                            bias_quant=Int32Bias,
                             weight_quant=weight_quant,
                             weight_bit_width=weight_bit_width,
                             return_quant_tensor=True),
