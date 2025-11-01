@@ -5,6 +5,7 @@ import brevitas.nn as qnn
 
 from brevitas.quant import Int32Bias
 from brevitas.quant import Int8Bias
+from brevitas.quant import IntBias
 
 from brevitas_examples.imagenet_classification.models.common import CommonIntWeightPerChannelQuant
 from brevitas_examples.imagenet_classification.models.common import CommonIntWeightPerTensorQuant
@@ -88,6 +89,8 @@ class QuantHswish(nn.Module):
         x = self.quant_out(x)
         return x
 
+class Int4Bias(IntBias):
+    bit_width = 4
 
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=4, weight_quant=CommonIntWeightPerTensorQuant, weight_bit_width=8, act_bit_width=8):
@@ -101,7 +104,7 @@ class SELayer(nn.Module):
                 ),
                 qnn.QuantLinear(channel, _make_divisible(channel // reduction, 8),
                                 bias=True,
-                                bias_quant=Int8Bias,
+                                bias_quant=Int4Bias if weight_bit_width == 4 else Int8Bias,
                                 weight_quant=weight_quant,
                                 weight_bit_width=weight_bit_width,
                                 return_quant_tensor=True),
@@ -111,7 +114,7 @@ class SELayer(nn.Module):
                               return_quant_tensor=True),
                 qnn.QuantLinear(_make_divisible(channel // reduction, 8), channel,
                             bias=True,
-                            bias_quant=Int8Bias,
+                            bias_quant=Int4Bias if weight_bit_width == 4 else Int8Bias,
                             weight_quant=weight_quant,
                             weight_bit_width=weight_bit_width,
                             return_quant_tensor=True),
@@ -264,7 +267,6 @@ class MobileNetV3(nn.Module):
             elif isinstance(m, nn.Linear) or isinstance(m, qnn.QuantLinear):
                 m.weight.data.normal_(0, 0.01)
                 m.bias.data.zero_()
-
 
 def mobilenetv3_large(**kwargs):
     """
