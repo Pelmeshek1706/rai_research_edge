@@ -352,6 +352,71 @@ This chapter documents a systematic **grid search** over robustness-oriented tra
 
 Across ~50 configurations per method family, **CutMix** delivered the best accuracy-to-cost trade-off on CIFAR-10 (cat vs. dog) with a frozen MobileNetV3-Small. **Label smoothing** reliably improved results at negligible cost, and **noise-averaged inference** offered an additional, training-free bump. **Temperature scaling** remains the recommended final step for calibrated probabilities. Methods with stronger theoretical robustness signals (e.g., **Jacobian** penalties, **spectral normalization**) were comparatively **compute-intensive** and didn’t surpass CutMix within our 10-epoch budget; they remain promising for extended training or robustness-centric evaluations. Overall, a **simple, production-friendly stack** — *CutMix + label smoothing + calibration (+ TTA at test time)* — is the most effective baseline to carry forward for this project. ([CVF Open Access][10])
 
+
+
+# Online Learning Implementation
+
+This repo now includes a **three-phase online-style protocol** that stress-tests transfer under mild domain shift while keeping the model/optimizer state continuous across phases.
+
+**Phases**
+
+1. **Phase A — Base train (CIFAR-10 cat/dog).**  
+   Train a frozen-backbone MobileNetV3-Small head to convergence (short schedule).
+
+2. **Phase B — Fixed-epoch online adaptation (Oxford-IIIT Pets, cat vs dog).**  
+   Continue training the **same** model for a few epochs on Pets (supervised). No replay; optimizer state is **not** reset.
+
+3. **Phase C — Verify under shift (STL-10 cat/dog).**  
+   Evaluate only (no updates) to measure retention/transfer.
+
+**Rationale**
+
+- Simulates *sequential* arrival of related domains (same label space).
+- Measures: (a) in-domain performance on A/B, (b) cross-domain generalization and potential forgetting, (c) zero-update verification on C.
+
+**How we map labels**
+
+- **CIFAR-10:** `{cat → 0, dog → 1}` (filter the official splits).
+- **Oxford-IIIT Pets:** map species to `{cat → 0, dog → 1}` (all cat breeds vs all dog breeds).
+- **STL-10:** filter classes to `cat` and `dog` (test split used for verification).
+
+**Notes**
+
+- **State continuity:** same `model` and optimizer across phases (Lightning won’t re-init them when you call `fit` again on the same instance).
+- **BN behavior:** with a frozen backbone, keep it in train mode only if you want running-stat updates on B; otherwise set backbone to `eval()` to lock stats.
+- **Forgetfulness check:** log A→B deltas; optionally add an **A-replay** loader in B if you want to quantify/mitigate forgetting.
+- **Speed:** adaptation B is intentionally short (e.g., 1–2 epochs) to mimic “few-shots online.”
+
+---
+
+# PGD Training (Adversarial Training, L∞)
+
+We added **Projected Gradient Descent Adversarial Training (PGD-AT)** as a drop-in option. This hardens the model against **iterative L∞ white-box** attacks.
+
+### Why
+
+Without adversarial training, accuracy collapses under strong white-box attacks at **ε = 8/255** (L∞):
+
+| Eval (pre-PGD-AT) | Clean |  FGSM |  PGD  | MI-FGSM | DI-FGSM | TI-FGSM |  APGD |
+| ----------------- | :---: | :---: | :---: | :-----: | :-----: | :-----: | :---: |
+| Accuracy          | 0.775 | 0.506 | 0.012 |  0.148  |  0.046  |  0.002  | 0.050 |
+
+> Interpretation: iterative attacks push nearly **all** samples across the decision boundary; the baseline is essentially defenseless at ε≈8/255.
+
+### How (implementation outline)
+
+- Inner maximization: **PGD-k** with random start, step size `α`, projection to `L∞(ε)`.
+- Loss: **CE on adversarial** (`adv_ratio=1.0` by default). Optionally mix with clean (`adv_ratio∈(0,1)`) or switch to TRADES-style KL.
+- Precision: run PGD in fp32 for stable gradients (model forward can still be autocast; clamp carefully).
+- Performance: keep `k` modest (e.g., 3–10) on MobileNetV3-Small.
+
+### Practical tips
+
+- **ε / α / k:** Start with `(8/255, 2/255, 5)`; increase `k` if evaluation is still too strong vs. training.
+- **Clean vs adv trade-off:** expect a modest **clean drop** (e.g., −5–15 pp) and a large **robustness gain**.
+- **Label smoothing:** often disabled for vanilla PGD-AT; if used, keep small (≤0.1).
+- **BN/EMA:** keep EMA off during AT until stable; re-enable later if needed.
+
 ---
 
 
