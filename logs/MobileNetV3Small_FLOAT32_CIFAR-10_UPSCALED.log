@@ -1,0 +1,3 @@
+2025-11-11 10:12:38,629 [INFO] Epoch [1/200] -> Train Loss: 2.0439, Train Acc: 24.25% | Test Loss: 2.1494, Test Acc: 19.85%
+2025-11-11 10:13:07,787 [INFO] Epoch [2/200] -> Train Loss: 2.0545, Train Acc: 24.26% | Test Loss: 2.1567, Test Acc: 23.14%
+2025-11-11 10:13:35,756 [INFO] Epoch [3/200] -> Train Loss: 2.0515, Train Acc: 23.87% | Test Loss: 2.1459, Test Acc: 20.47%
