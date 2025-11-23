@@ -12,7 +12,7 @@ import torch
 
 from .callbacks import PhaseValMetricsCallback
 from .data import CIFAR10CatDogDM, IMAGENET_MEAN, IMAGENET_STD
-from .models import LitBinaryClassifier
+from .models import LitBinaryClassifier, LitBinaryClassifierBrevitas
 
 
 def set_seed(seed: int = 42):
@@ -78,7 +78,18 @@ def train_and_attack(recipe: dict, out_dir: Optional[str] = None) -> Dict[str, d
     adv = recipe.get("attack_injection", recipe.get("adv_training", {"enabled": False}))
     phaseA_epochs = int(m.get("phaseA_epochs", 0))
 
-    model = LitBinaryClassifier(
+    # model = LitBinaryClassifier(
+    #     lr=recipe.get("opt", {}).get("lr", 3e-4),
+    #     weight_decay=recipe.get("opt", {}).get("wd", 1e-4),
+    #     pretrained=m.get("pretrained", True),
+    #     freeze_backbone=m.get("freeze_backbone", False),
+    #     dropout_p=m.get("dropout_p", 0.2),
+    #     adv_cfg=adv,
+    #     phaseA_epochs=phaseA_epochs,
+    #     mean=IMAGENET_MEAN,
+    #     std=IMAGENET_STD,
+    # )
+    model = LitBinaryClassifierBrevitas(
         lr=recipe.get("opt", {}).get("lr", 3e-4),
         weight_decay=recipe.get("opt", {}).get("wd", 1e-4),
         pretrained=m.get("pretrained", True),
