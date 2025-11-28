@@ -136,10 +136,42 @@ class CIFAR10CatDogDM(L.LightningDataModule):
         return self._dl(self.test_ds, False)
 
 
+class STL10CatDog(Dataset):
+    """Binary STL10 cats/dogs subset used for Phase B online adaptation."""
+
+    CAT, DOG = 3, 5
+
+    def __init__(
+        self,
+        root: str = "./data",
+        split: str = "train",
+        img_size: int = 224,
+        transform=None,
+    ) -> None:
+        super().__init__()
+        if split not in {"train", "test"}:
+            raise ValueError(f"Unsupported STL10 split: {split}")
+        self.base = datasets.STL10(root, split=split, download=True)
+        self.transform = transform or tf_train(img_size)
+        keep = (self.CAT, self.DOG)
+        self.idxs = [i for i, (_, y) in enumerate(self.base) if y in keep]
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, i: int):
+        x, y = self.base[self.idxs[i]]
+        if self.transform is not None:
+            x = self.transform(x)
+        label = 0 if y == self.CAT else 1
+        return x, label
+
+
 __all__ = [
     "IMAGENET_MEAN",
     "IMAGENET_STD",
     "tf_train",
     "tf_eval",
     "CIFAR10CatDogDM",
+    "STL10CatDog",
 ]

@@ -9,17 +9,21 @@ from typing import Dict, Optional
 
 import lightning as L
 import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .callbacks import PhaseValMetricsCallback
-from .data import CIFAR10CatDogDM, IMAGENET_MEAN, IMAGENET_STD
+from .data import CIFAR10CatDogDM, IMAGENET_MEAN, IMAGENET_STD, STL10CatDog, tf_train
 from .models import LitBinaryClassifier, LitBinaryClassifierBrevitas
+from .attacks import _build_attack, _to01, _tonorm
 
 
 def set_seed(seed: int = 42):
     """Fix Python and torch random seeds so repeated runs give the same results."""
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 set_seed(42)
@@ -40,13 +44,23 @@ def make_trainer(
     """Build a Lightning trainer that runs for the given epochs and uses the provided callbacks."""
     torch.set_float32_matmul_precision("medium")
     use_cuda = torch.cuda.is_available()
+    use_mps = (
+        not use_cuda
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+    accelerator = "gpu" if use_cuda else "mps" if use_mps else "cpu"
+
     if precision_override is None:
-        bf16_ok = use_cuda and torch.cuda.is_bf16_supported()
-        precision = "bf16-mixed" if bf16_ok else ("16-mixed" if use_cuda else "32-true")
+        if use_cuda:
+            bf16_ok = torch.cuda.is_bf16_supported()
+            precision = "bf16-mixed" if bf16_ok else "16-mixed"
+        else:
+            precision = "32-true"
     else:
         precision = precision_override
     trainer = L.Trainer(
-        accelerator="gpu" if use_cuda else "cpu",
+        accelerator=accelerator,
         devices=1,
         precision=precision,
         max_epochs=int(epochs),
@@ -59,6 +73,146 @@ def make_trainer(
         callbacks=callbacks or [],
     )
     return trainer
+
+
+def _build_phaseB_loader(cfg: dict) -> DataLoader:
+    """Return the DataLoader for Phase B online training (defaults to STL10 cats/dogs)."""
+    dataset_name = cfg.get("dataset", "stl10").lower()
+    if dataset_name == "stl10":
+        root = cfg.get("root", "./data")
+        batch_size = cfg.get("batch_size", 128)
+        num_workers = cfg.get("num_workers", 0)
+        img_size = cfg.get("img_size", 224)
+        pin_memory = cfg.get("pin_memory", False)
+        stl_split = cfg.get("split", "train")
+
+        ds = STL10CatDog(
+            root=root,
+            split=stl_split,
+            img_size=img_size,
+            transform=tf_train(img_size),
+        )
+        loader_args = dict(
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+            persistent_workers=False,
+        )
+        if num_workers > 0:
+            loader_args["prefetch_factor"] = 2
+        return DataLoader(ds, **loader_args)
+    if dataset_name == "cifar10":
+        dm = CIFAR10CatDogDM(
+            root=cfg.get("root", "./data"),
+            batch_size=cfg.get("batch_size", 128),
+            num_workers=cfg.get("num_workers", 0),
+            img_size=cfg.get("img_size", 224),
+            val_ratio=cfg.get("val_ratio", 0.0),
+            pin_memory=cfg.get("pin_memory", False),
+        )
+        dm.setup()
+        return dm.train_dataloader()
+    raise ValueError(f"Unsupported Phase B dataset: {dataset_name}")
+
+
+def _prepare_attacked_batch(model, x, y, adv_cfg):
+    """Mirror the attack augmentation logic but force Phase B behavior."""
+    cfg = adv_cfg or {}
+    if not cfg.get("enabled", False):
+        return x, y
+
+    freq = int(cfg.get("every_n", 0))
+    if freq <= 0:
+        return x, y
+
+    idx = torch.arange(x.size(0), device=x.device)
+    target_pos = (freq - 1) % freq
+    mask = (idx % freq) == target_pos
+    if not torch.any(mask):
+        return x, y
+
+    if not hasattr(model, "mean_buf") or not hasattr(model, "std_buf"):
+        raise RuntimeError("Model missing normalization buffers for adversarial augmentation.")
+    attack = _build_attack(model, cfg, model.mean_buf, model.std_buf, device=x.device)
+    x_sel = x[mask]
+    y_sel = y[mask]
+    x01 = _to01(x_sel, model.mean_buf, model.std_buf).clamp_(0.0, 1.0)
+
+    was_training = model.training
+    model.eval()
+    adv01 = attack(x01, y_sel)
+    if was_training:
+        model.train()
+
+    adv_norm = _tonorm(adv01.detach(), model.mean_buf, model.std_buf)
+    x_aug = torch.cat([x, adv_norm], dim=0)
+    y_aug = torch.cat([y, y_sel], dim=0)
+    return x_aug, y_aug
+
+
+def run_phaseB_online_training(
+    model,
+    loader: DataLoader,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    adv_cfg: dict,
+) -> dict:
+    """Online Phase B: evaluate attacked batches for pseudo-labels, then train on them."""
+    if epochs <= 0:
+        return {}
+
+    device = next(model.parameters()).device
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    criterion = getattr(model, "criterion", torch.nn.CrossEntropyLoss())
+
+    total_steps = 0
+    total_loss = 0.0
+    total_eval_acc = 0.0
+    total_gt_acc = 0.0
+    
+    for epoch in tqdm(range(epochs)):
+        for batch in loader:
+            total_steps += 1
+            x, y_true = batch
+            x = x.to(device, non_blocking=True)
+            y_true = y_true.to(device, non_blocking=True)
+
+            x_aug, y_aug = _prepare_attacked_batch(model, x, y_true, adv_cfg)
+
+            with torch.no_grad():
+                model.eval()
+                logits_eval = model(x_aug)
+                pseudo_labels = torch.argmax(logits_eval, dim=1)
+                eval_acc = (pseudo_labels == y_aug).float().mean().item()
+            model.train()
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x_aug)
+            loss = criterion(logits, pseudo_labels)
+            loss.backward()
+            optimizer.step()
+
+            total_eval_acc += eval_acc
+
+            preds_vs_true = torch.argmax(logits.detach(), dim=1)
+            gt_acc = (preds_vs_true == y_aug).float().mean().item()
+            total_gt_acc += gt_acc
+            total_loss += float(loss.detach().cpu())
+
+    if total_steps == 0:
+        return {}
+
+    return {
+        "phaseB_eval_acc": total_eval_acc / total_steps,
+        "phaseB_train_acc": total_gt_acc / total_steps,
+        "phaseB_train_loss": total_loss / total_steps,
+        "phaseB_steps": total_steps,
+        "phaseB_epochs": epochs,
+    }
 
 
 def train_and_attack(recipe: dict, out_dir: Optional[str] = None) -> Dict[str, dict]:
@@ -103,25 +257,58 @@ def train_and_attack(recipe: dict, out_dir: Optional[str] = None) -> Dict[str, d
 
     t = recipe.get("trainer", {})
     total_epochs = int(t.get("epochs", 10))
+    phaseB_epochs = max(0, total_epochs - phaseA_epochs)
 
     phase_cb = PhaseValMetricsCallback(phaseA_epochs=phaseA_epochs)
     trainer = make_trainer(
         root=t.get("root", "./runs/online"),
-        epochs=total_epochs,
+        epochs=max(phaseA_epochs, 1),
         callbacks=[phase_cb],
     )
 
     print(
         f"[Orchestrator] Phase A epochs: {phaseA_epochs}, "
-        f"Phase B epochs: {total_epochs - phaseA_epochs}"
+        f"Phase B epochs: {phaseB_epochs}"
     )
-    trainer.fit(model, datamodule=dm, ckpt_path=None)
+    if phaseA_epochs > 0:
+        trainer.fit(model, datamodule=dm, ckpt_path=None)
+    else:
+        print("[Orchestrator] Skipping Phase A training (0 epochs requested).")
+
+    phaseB_metrics = {}
+    if phaseB_epochs > 0:
+        dataB_cfg = recipe.get(
+            "phaseB_data",
+            {
+                "root": "./data",
+                "batch_size": d.get("batch_size", 128),
+                "num_workers": d.get("num_workers", 0),
+                "img_size": d.get("img_size", 224),
+                "pin_memory": d.get("pin_memory", False),
+                "dataset": "stl10",
+                "split": "train",
+            },
+        )
+        loaderB = _build_phaseB_loader(dataB_cfg)
+        opt_cfg = recipe.get("opt", {})
+        print("[Orchestrator] Phase B online adaptation (pseudo-labeling) begins.")
+        phaseB_metrics = run_phaseB_online_training(
+            model=model,
+            loader=loaderB,
+            epochs=phaseB_epochs,
+            lr=opt_cfg.get("lr", 3e-4),
+            weight_decay=opt_cfg.get("wd", 1e-4),
+            adv_cfg=adv,
+        )
+        del loaderB
+        print("[Orchestrator] Phase B metrics:", phaseB_metrics)
 
     print("[Orchestrator] Phase C: final validation/test on CIFAR10 cats/dogs (no updates).")
     val_metrics = trainer.validate(model, datamodule=dm, ckpt_path=None)
     test_metrics = trainer.test(model, datamodule=dm, ckpt_path=None)
 
     phase_metrics = phase_cb.compute_phase_metrics()
+    phase_metrics.update(phaseB_metrics)
     metrics: Dict[str, dict] = {
         "val": val_metrics[0] if val_metrics else {},
         "test": test_metrics[0] if test_metrics else {},

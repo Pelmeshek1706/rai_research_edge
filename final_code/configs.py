@@ -24,6 +24,15 @@ BASE_ONLINE_ATTACK_RECIPE = {
         "val_ratio": 0.10,
         "pin_memory": False,
     },
+    "phaseB_data": {
+        "root": "./data",
+        "batch_size": 256,
+        "num_workers": 0,
+        "img_size": 224,
+        "pin_memory": False,
+        "dataset": "stl10",
+        "split": "train",
+    },
     "model": {
         "pretrained": True,
         "freeze_backbone": False,
@@ -151,6 +160,17 @@ def _grid_patches_for_method_online(method: str, variants_per_method: int = 5) -
     return grid[: max(1, int(variants_per_method))]
 
 
+def phaseB_dataset_patch(dataset: str = "stl10", **phaseB_kwargs) -> Dict[str, dict]:
+    """Return a small patch that switches Phase B to the requested cat/dog dataset."""
+    dataset = dataset.lower()
+    allowed = {"stl10", "cifar10"}
+    if dataset not in allowed:
+        raise ValueError(f"Unsupported Phase B dataset: {dataset}")
+    patch = {"phaseB_data": {"dataset": dataset}}
+    patch["phaseB_data"].update(phaseB_kwargs)
+    return patch
+
+
 def get_recipes_for_benchmark_online_attack(
     every_n: int = 4,
     epochs_phaseA: int = 10,
@@ -223,4 +243,5 @@ __all__ = [
     "deep_update",
     "method_patch_online",
     "get_recipes_for_benchmark_online_attack",
+    "phaseB_dataset_patch",
 ]

@@ -1,0 +1,5 @@
+.data
+.grid_results
+runs
+__pycache__
+*.pyc
