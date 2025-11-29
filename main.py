@@ -9,7 +9,7 @@ from final_code.configs import (
 from final_code.runner import run_recipes_and_collect
 
 # Choose dataset for Phase B online adaptation: "stl10" or "cifar10"
-PHASEB_DATASET = "cifar10"
+PHASEB_DATASET = "stl10"
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
         patch = phaseB_dataset_patch(PHASEB_DATASET)
         for recipe in recipes.values():
             deep_update(recipe, patch)
-
+    
     summary = run_recipes_and_collect(recipes, out_dir="./grid_results")
     print(summary.head())
     summary.to_csv("summary_online_attack_brevitas.csv", index=False)

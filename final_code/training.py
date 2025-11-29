@@ -5,6 +5,7 @@ import gc
 import json
 import os
 import random
+import sys
 from typing import Dict, Optional
 
 import lightning as L
@@ -33,6 +34,28 @@ try:
 except Exception:
     pass
 torch.backends.cudnn.benchmark = False
+
+
+def _get_peak_memory_bytes() -> Optional[int]:
+    """Best-effort process peak memory (GPU if available, else CPU RSS)."""
+    if torch.cuda.is_available():
+        try:
+            return int(torch.cuda.max_memory_reserved())
+        except Exception:
+            try:
+                return int(torch.cuda.max_memory_allocated())
+            except Exception:
+                return None
+    try:
+        import resource
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if rss is None:
+            return None
+        # Linux reports KB, macOS reports bytes.
+        return int(rss if sys.platform == "darwin" else rss * 1024)
+    except Exception:
+        return None
 
 
 def make_trainer(
@@ -173,9 +196,9 @@ def run_phaseB_online_training(
     total_loss = 0.0
     total_eval_acc = 0.0
     total_gt_acc = 0.0
-    
-    for epoch in tqdm(range(epochs)):
-        for batch in loader:
+        
+    for epoch in tqdm(range(epochs), desc="Epochs"):
+        for batch in tqdm(loader, desc=f"Epoch {epoch+1} - batches", leave=False):
             total_steps += 1
             x, y_true = batch
             x = x.to(device, non_blocking=True)
@@ -188,6 +211,7 @@ def run_phaseB_online_training(
                 logits_eval = model(x_aug)
                 pseudo_labels = torch.argmax(logits_eval, dim=1)
                 eval_acc = (pseudo_labels == y_aug).float().mean().item()
+                del logits_eval
             model.train()
 
             optimizer.zero_grad(set_to_none=True)
@@ -202,6 +226,18 @@ def run_phaseB_online_training(
             gt_acc = (preds_vs_true == y_aug).float().mean().item()
             total_gt_acc += gt_acc
             total_loss += float(loss.detach().cpu())
+
+            del (
+                x,
+                y_true,
+                x_aug,
+                y_aug,
+                pseudo_labels,
+                logits,
+                loss,
+                preds_vs_true,
+            )
+            torch.cuda.empty_cache()
 
     if total_steps == 0:
         return {}
@@ -227,6 +263,11 @@ def train_and_attack(recipe: dict, out_dir: Optional[str] = None) -> Dict[str, d
         pin_memory=d.get("pin_memory", False),
     )
     dm.setup()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
     m = recipe.get("model", {})
     adv = recipe.get("attack_injection", recipe.get("adv_training", {"enabled": False}))
@@ -309,10 +350,13 @@ def train_and_attack(recipe: dict, out_dir: Optional[str] = None) -> Dict[str, d
 
     phase_metrics = phase_cb.compute_phase_metrics()
     phase_metrics.update(phaseB_metrics)
+    mem_peak_bytes = _get_peak_memory_bytes()
     metrics: Dict[str, dict] = {
         "val": val_metrics[0] if val_metrics else {},
         "test": test_metrics[0] if test_metrics else {},
         "phases": phase_metrics,
+        "mem_peak_bytes": mem_peak_bytes,
+        "mem_peak_GiB": float(mem_peak_bytes) / (1024 ** 3) if mem_peak_bytes is not None else None,
     }
 
     if out_dir is not None:
