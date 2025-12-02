@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+from datetime import datetime
 from typing import Dict
 
 import pandas as pd
@@ -39,6 +40,7 @@ def run_recipes_and_collect(recipes: Dict[str, dict], out_dir: str = "./grid_res
         if mem_peak_gib is None and mem_peak_bytes is not None:
             mem_peak_gib = float(mem_peak_bytes) / (1024 ** 3)
 
+        timestamp = datetime.now().strftime("%M-%H-%d-%m-%Y")
         row = {
             "recipe": name,
             "k": 1,
@@ -51,8 +53,14 @@ def run_recipes_and_collect(recipes: Dict[str, dict], out_dir: str = "./grid_res
             "mem_peak_GiB": float(mem_peak_gib) if mem_peak_gib is not None else None,
             "config": recipe,
             "metrics_json": json.dumps(metrics),
+            "timestamp": timestamp,
         }
         rows.append(row)
+
+        recipe_dir = os.path.join(out_dir, name)
+        os.makedirs(recipe_dir, exist_ok=True)
+        recipe_df = pd.DataFrame([row])
+        recipe_df.to_csv(os.path.join(recipe_dir, f"metrics_{timestamp}.csv"), index=False)
 
         del metrics
         gc.collect()
